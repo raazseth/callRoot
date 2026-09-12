@@ -82,3 +82,14 @@ export async function onScanProgress(callback: (progress: ScanProgress) => void)
     callback(event.payload);
   });
 }
+
+/// Fired by IndexWorker after each batch of mutations (upsert, mark-missing, reconcile).
+/// Frontend listens to this event to reload the document list reactively.
+export async function onIndexUpdate(callback: () => void): Promise<UnlistenFn> {
+  if (!isTauriAvailable()) {
+    return () => {};
+  }
+  return await listen('index-update', () => {
+    callback();
+  });
+}

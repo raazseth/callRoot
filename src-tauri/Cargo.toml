@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "root-core"
 version = "0.1.0"
 description = "Root Core Desktop Indexer Application"
@@ -18,3 +18,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 walkdir = "2.5"
 notify = "6.1"
 tokio = { version = "1.38", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"

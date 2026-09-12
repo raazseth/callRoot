@@ -1,16 +1,20 @@
 pub mod commands;
 pub mod database;
 pub mod filesystem;
+pub mod indexer;
 
 use database::{get_folders, init_database};
-use filesystem::{scan_folder_files, AppWatcherManager};
+use filesystem::AppWatcherManager;
+use indexer::{IndexCommand, IndexSender, IndexWorker};
 use rusqlite::Connection;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use tauri::{Manager, RunEvent};
 
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub watcher: Arc<Mutex<AppWatcherManager>>,
+    /// Sender end of the IndexWorker channel. Clone freely; the worker owns the Receiver.
+    pub index_tx: IndexSender,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -27,42 +31,66 @@ pub fn run() {
 
             let conn = init_database(&db_path).expect("Failed to initialize SQLite database");
             let db_arc = Arc::new(Mutex::new(conn));
-            let watcher_arc = Arc::new(Mutex::new(AppWatcherManager::new()));
+
+            // Create the IndexWorker channel (bounded 1024 to bound burst events)
+            let (tx, rx) = mpsc::sync_channel::<IndexCommand>(1024);
+            let index_sender = IndexSender(tx.clone());
+
+            // Spawn the IndexWorker on a dedicated std::thread (not Tokio's blocking pool)
+            let worker_db = db_arc.clone();
+            let worker_handle = app.handle().clone();
+            std::thread::Builder::new()
+                .name("root-index-worker".to_string())
+                .spawn(move || {
+                    IndexWorker::new(worker_db, worker_handle, rx).run();
+                })
+                .expect("Failed to spawn IndexWorker thread");
+
+            let watcher_arc = Arc::new(Mutex::new(AppWatcherManager::new(index_sender.clone())));
 
             app.manage(AppState {
                 db: db_arc.clone(),
                 watcher: watcher_arc.clone(),
+                index_tx: index_sender.clone(),
             });
 
-            // Start watching folders and perform scan_on_launch
+            // Re-watch all previously saved folders and kick off reconciliation
             let app_handle = app.handle().clone();
             let db_clone = db_arc.clone();
             let watcher_clone = watcher_arc.clone();
+            let tx_clone = index_sender.clone();
 
             tauri::async_runtime::spawn(async move {
-                if let Ok(conn) = db_clone.lock() {
-                    if let Ok(folders) = get_folders(&conn) {
-                        drop(conn);
-                        for folder in folders {
-                            if let Ok(mut mgr) = watcher_clone.lock() {
-                                mgr.watch_folder(&folder.path, app_handle.clone());
+                let folders = {
+                    match db_clone.lock() {
+                        Ok(conn) => match get_folders(&conn) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("[startup] failed to read folders: {e}");
+                                return;
                             }
-
-                            // Perform startup background scan
-                            let db = db_clone.clone();
-                            let handle = app_handle.clone();
-                            let f_id = folder.id;
-                            let f_path = folder.path.clone();
-
-                            tokio::task::spawn_blocking(move || {
-                                let docs = scan_folder_files(f_id, &f_path, Some(&handle));
-                                if let Ok(conn) = db.lock() {
-                                    for doc in docs {
-                                        let _ = database::save_document(&conn, &doc);
-                                    }
-                                }
-                            });
+                        },
+                        Err(e) => {
+                            eprintln!("[startup] DB lock error: {e}");
+                            return;
                         }
+                    }
+                };
+
+                for folder in folders {
+                    // Register with watcher
+                    if let Ok(mut mgr) = watcher_clone.lock() {
+                        if let Err(e) = mgr.watch_folder(&folder.path, app_handle.clone()) {
+                            eprintln!("[startup] watcher warning for {}: {e}", folder.path);
+                        }
+                    }
+
+                    // Queue reconciliation for each folder
+                    if let Err(e) = tx_clone.send(IndexCommand::ReconcileFolder {
+                        folder_id: folder.id,
+                        folder_path: folder.path,
+                    }) {
+                        eprintln!("[startup] failed to queue reconcile: {e}");
                     }
                 }
             });
@@ -81,8 +109,15 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| match event {
-            RunEvent::ExitRequested { .. } => {}
+        .run(|app_handle, event| match event {
+            RunEvent::ExitRequested { .. } => {
+                // Signal the IndexWorker to shut down cleanly
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    if let Err(e) = state.index_tx.send(IndexCommand::Shutdown) {
+                        eprintln!("[shutdown] failed to signal worker shutdown: {e}");
+                    }
+                }
+            }
             _ => {}
         });
 }

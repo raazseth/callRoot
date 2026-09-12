@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+﻿import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { SearchBar } from './components/SearchBar';
 import { EmptyState } from './components/EmptyState';
@@ -9,11 +9,10 @@ import {
   removeFolder,
   rescanFolder,
   getDocuments,
-  searchDocuments,
   openDocument,
   removeDocumentFromIndex,
   onScanProgress,
-  isTauriAvailable,
+  onIndexUpdate,
 } from './api/tauri';
 import { WatchedFolder, DocumentRecord, ScanProgress } from './types';
 
@@ -22,6 +21,7 @@ export const App: React.FC = () => {
   const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [error, setError] = useState<string | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress>({
     processed: 0,
     total: 0,
@@ -29,38 +29,49 @@ export const App: React.FC = () => {
     is_scanning: false,
   });
 
-  // Load initial data
+  // Ref so event callbacks always read the latest activeFolderId
+  // without needing to re-subscribe when the folder changes.
+  const activeFolderIdRef = useRef<number | null>(activeFolderId);
+  useEffect(() => {
+    activeFolderIdRef.current = activeFolderId;
+  }, [activeFolderId]);
+
+  // Subscribe to backend events once on mount.
   useEffect(() => {
     loadFoldersAndDocuments();
 
-    let unlisten: (() => void) | null = null;
+    let unlistenProgress: (() => void) | null = null;
+    let unlistenIndex: (() => void) | null = null;
+
+    // scan-progress: update progress bar
     onScanProgress((progress) => {
       setScanProgress(progress);
-      if (!progress.is_scanning) {
-        // Refresh documents when scanning finishes
-        loadDocuments(activeFolderId);
-      }
-    }).then((unlistenFn) => {
-      unlisten = unlistenFn;
+    }).then((fn) => {
+      unlistenProgress = fn;
+    });
+
+    // index-update: IndexWorker finished a mutation batch → reload documents
+    onIndexUpdate(() => {
+      loadDocuments(activeFolderIdRef.current);
+    }).then((fn) => {
+      unlistenIndex = fn;
     });
 
     return () => {
-      if (unlisten) unlisten();
+      if (unlistenProgress) unlistenProgress();
+      if (unlistenIndex) unlistenIndex();
     };
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadFoldersAndDocuments = async () => {
     try {
       const folderList = await getFolders();
       setFolders(folderList);
-
-      if (folderList.length > 0) {
-        await loadDocuments(activeFolderId);
-      } else {
-        setDocuments([]);
-      }
+      await loadDocuments(activeFolderIdRef.current);
     } catch (err) {
-      console.error('Failed to load initial data:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('Failed to load initial data:', msg);
+      setError(`Failed to load data: ${msg}`);
     }
   };
 
@@ -69,61 +80,80 @@ export const App: React.FC = () => {
       const docs = await getDocuments(folderId ?? null);
       setDocuments(docs);
     } catch (err) {
-      console.error('Failed to load documents:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('Failed to load documents:', msg);
+      setError(`Failed to load documents: ${msg}`);
     }
   };
 
   const handleAddFolder = async () => {
     try {
+      setError(null);
       const newFolder = await addFolder();
       if (newFolder) {
         await loadFoldersAndDocuments();
       }
     } catch (err) {
-      console.error('Error adding watched folder:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('Error adding watched folder:', msg);
+      setError(`Failed to add folder: ${msg}`);
     }
   };
 
   const handleRemoveFolder = async (folderId: number) => {
     try {
+      setError(null);
       await removeFolder(folderId);
       if (activeFolderId === folderId) {
         setActiveFolderId(null);
+        activeFolderIdRef.current = null;
       }
       await loadFoldersAndDocuments();
     } catch (err) {
-      console.error('Error removing folder:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('Error removing folder:', msg);
+      setError(`Failed to remove folder: ${msg}`);
     }
   };
 
   const handleRescanFolder = async (folderId: number) => {
     try {
-      setScanProgress({ processed: 0, total: 0, current_file: 'Initializing scan...', is_scanning: true });
+      setError(null);
+      setScanProgress({ processed: 0, total: 0, current_file: 'Initializing scan…', is_scanning: true });
       await rescanFolder(folderId);
-      await loadDocuments(activeFolderId);
+      // Documents will reload via index-update event when reconciliation completes
     } catch (err) {
-      console.error('Error rescanning folder:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('Error rescanning folder:', msg);
+      setError(`Failed to rescan folder: ${msg}`);
+      setScanProgress((prev) => ({ ...prev, is_scanning: false }));
     }
   };
 
   const handleOpenDoc = async (path: string) => {
     try {
+      setError(null);
       await openDocument(path);
     } catch (err) {
-      console.error('Error opening document:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('Error opening document:', msg);
+      setError(`Failed to open file: ${msg}`);
     }
   };
 
   const handleRemoveDoc = async (docId: number) => {
     try {
+      setError(null);
       await removeDocumentFromIndex(docId);
       setDocuments((prev) => prev.filter((d) => d.id !== docId));
     } catch (err) {
-      console.error('Error removing document from index:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('Error removing document from index:', msg);
+      setError(`Failed to remove document: ${msg}`);
     }
   };
 
-  // Case-insensitive, partial match search filter
+  // Client-side search filter (fast, no additional IPC round-trip)
   const filteredDocuments = useMemo(() => {
     if (!searchQuery.trim()) return documents;
     const q = searchQuery.toLowerCase().trim();
@@ -137,6 +167,7 @@ export const App: React.FC = () => {
         activeFolderId={activeFolderId}
         onSelectFolder={(id) => {
           setActiveFolderId(id);
+          activeFolderIdRef.current = id;
           loadDocuments(id);
         }}
         onAddFolder={handleAddFolder}
@@ -151,6 +182,34 @@ export const App: React.FC = () => {
           onQueryChange={setSearchQuery}
           resultCount={filteredDocuments.length}
         />
+
+        {error && (
+          <div
+            className="error-banner"
+            role="alert"
+            style={{
+              background: 'rgba(255,60,60,0.12)',
+              border: '1px solid rgba(255,60,60,0.4)',
+              borderRadius: '8px',
+              padding: '10px 16px',
+              margin: '8px 16px',
+              fontSize: '13px',
+              color: '#ff6b6b',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+            }}
+          >
+            <span>{error}</span>
+            <button
+              onClick={() => setError(null)}
+              style={{ background: 'none', border: 'none', color: '#ff6b6b', cursor: 'pointer', fontSize: '16px' }}
+              aria-label="Dismiss error"
+            >
+              ×
+            </button>
+          </div>
+        )}
 
         {folders.length === 0 ? (
           <EmptyState onAddFolder={handleAddFolder} />
@@ -167,10 +226,10 @@ export const App: React.FC = () => {
             <span className={`status-dot ${scanProgress.is_scanning ? 'scanning' : ''}`}></span>
             <span>
               {scanProgress.is_scanning
-                ? `Scanning documents... ${scanProgress.processed} files indexed`
+                ? `Indexing… ${scanProgress.processed} files processed`
                 : folders.length === 0
                 ? 'No monitored folders'
-                : `Ready • ${documents.length} active documents indexed`}
+                : `Ready • ${documents.length} active documents`}
             </span>
           </div>
           {scanProgress.is_scanning && (
@@ -179,11 +238,10 @@ export const App: React.FC = () => {
                 {scanProgress.current_file}
               </span>
               <div className="progress-bar-container">
+                {/* Indeterminate progress — no fake total */}
                 <div
-                  className="progress-bar-fill"
-                  style={{
-                    width: scanProgress.total > 0 ? `${(scanProgress.processed / scanProgress.total) * 100}%` : '50%',
-                  }}
+                  className="progress-bar-fill progress-bar-indeterminate"
+                  style={{ width: '40%' }}
                 />
               </div>
             </div>

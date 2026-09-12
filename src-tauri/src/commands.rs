@@ -1,11 +1,10 @@
 use crate::database::{
-    add_folder, get_folders, query_documents, query_documents_like, remove_document, remove_folder, save_document,
-    WatchedFolder, DocumentRecord,
+    add_folder, get_folders, query_documents, query_documents_like, remove_folder, DocumentRecord,
+    WatchedFolder,
 };
-use crate::filesystem::scan_folder_files;
+use crate::indexer::IndexCommand;
 use crate::AppState;
 use tauri::{AppHandle, State};
-use std::process::Command;
 
 #[tauri::command]
 pub async fn cmd_add_folder(
@@ -13,32 +12,25 @@ pub async fn cmd_add_folder(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<WatchedFolder, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    // 1. Persist folder to DB
+    let folder = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        add_folder(&conn, &path).map_err(|e| format!("Failed to add folder: {e}"))?
+    };
 
-    let folder = add_folder(&conn, &path).map_err(|e| e.to_string())?;
-    
-    // Watch folder
-    if let Ok(mut watcher_mgr) = state.watcher.lock() {
-        watcher_mgr.watch_folder(&folder.path, app_handle.clone());
+    // 2. Register with watcher
+    {
+        let mut watcher = state.watcher.lock().map_err(|e| e.to_string())?;
+        if let Err(e) = watcher.watch_folder(&folder.path, app_handle) {
+            eprintln!("[cmd_add_folder] watcher warning: {e}");
+        }
     }
 
-    // Perform initial scan backgrounded
-    let folder_id = folder.id;
-    let folder_path = folder.path.clone();
-
-    // Release lock before scan
-    drop(conn);
-
-    let state_db = state.db.clone();
-    let app = app_handle.clone();
-    tokio::task::spawn_blocking(move || {
-        let docs = scan_folder_files(folder_id, &folder_path, Some(&app));
-        if let Ok(conn) = state_db.lock() {
-            for doc in docs {
-                let _ = save_document(&conn, &doc);
-            }
-        }
-    });
+    // 3. Kick off reconciliation (non-blocking — IndexWorker handles it)
+    state.index_tx.send(IndexCommand::ReconcileFolder {
+        folder_id: folder.id,
+        folder_path: folder.path.clone(),
+    })?;
 
     Ok(folder)
 }
@@ -46,42 +38,59 @@ pub async fn cmd_add_folder(
 #[tauri::command]
 pub async fn cmd_get_folders(state: State<'_, AppState>) -> Result<Vec<WatchedFolder>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    get_folders(&conn).map_err(|e| e.to_string())
+    get_folders(&conn).map_err(|e| format!("Failed to get folders: {e}"))
 }
 
 #[tauri::command]
 pub async fn cmd_remove_folder(folder_id: i64, state: State<'_, AppState>) -> Result<bool, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    remove_folder(&conn, folder_id).map_err(|e| e.to_string())?;
+    // 1. Look up path before deleting (needed for unwatch)
+    let folder_path = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let folders = get_folders(&conn).map_err(|e| format!("Failed to look up folder: {e}"))?;
+        folders
+            .into_iter()
+            .find(|f| f.id == folder_id)
+            .map(|f| f.path)
+    };
+
+    // 2. Stop watching BEFORE removing DB records
+    if let Some(ref path) = folder_path {
+        let mut watcher = state.watcher.lock().map_err(|e| e.to_string())?;
+        if let Err(e) = watcher.unwatch_folder(path) {
+            eprintln!("[cmd_remove_folder] unwatch warning: {e}");
+            // Non-fatal: continue with DB removal
+        }
+    }
+
+    // 3. Remove from DB (cascade deletes child documents)
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        remove_folder(&conn, folder_id)
+            .map_err(|e| format!("Failed to remove folder from DB: {e}"))?;
+    }
+
     Ok(true)
 }
 
 #[tauri::command]
-pub async fn cmd_rescan_folder(
-    folder_id: i64,
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
-) -> Result<bool, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let folders = get_folders(&conn).map_err(|e| e.to_string())?;
-    
-    let folder = folders.into_iter().find(|f| f.id == folder_id);
-    drop(conn);
+pub async fn cmd_rescan_folder(folder_id: i64, state: State<'_, AppState>) -> Result<bool, String> {
+    let folder = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let folders = get_folders(&conn).map_err(|e| format!("Failed to look up folder: {e}"))?;
+        folders.into_iter().find(|f| f.id == folder_id)
+    };
 
-    if let Some(target) = folder {
-        let state_db = state.db.clone();
-        let app = app_handle.clone();
-        tokio::task::spawn_blocking(move || {
-            let docs = scan_folder_files(target.id, &target.path, Some(&app));
-            if let Ok(conn) = state_db.lock() {
-                for doc in docs {
-                    let _ = save_document(&conn, &doc);
-                }
-            }
-        });
+    match folder {
+        Some(f) => {
+            // Non-blocking: IndexWorker runs reconciliation in background
+            state.index_tx.send(IndexCommand::ReconcileFolder {
+                folder_id: f.id,
+                folder_path: f.path,
+            })?;
+            Ok(true)
+        }
+        None => Err(format!("Folder with id={folder_id} not found")),
     }
-
-    Ok(true)
 }
 
 #[tauri::command]
@@ -90,7 +99,7 @@ pub async fn cmd_get_documents(
     state: State<'_, AppState>,
 ) -> Result<Vec<DocumentRecord>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    query_documents(&conn, folder_id).map_err(|e| e.to_string())
+    query_documents(&conn, folder_id).map_err(|e| format!("Failed to query documents: {e}"))
 }
 
 #[tauri::command]
@@ -100,38 +109,54 @@ pub async fn cmd_search_documents(
     state: State<'_, AppState>,
 ) -> Result<Vec<DocumentRecord>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    query_documents_like(&conn, &query, folder_id).map_err(|e| e.to_string())
+    query_documents_like(&conn, &query, folder_id).map_err(|e| format!("Search failed: {e}"))
 }
 
+/// Open a file using the OS default application.
+///
+/// Safety: does NOT invoke a shell interpreter.
+/// - Windows: uses `explorer.exe <path>` directly (ShellExecute equivalent via Process)
+/// - macOS:   `open <path>`
+/// - Linux:   `xdg-open <path>`
+///
+/// The path is passed as a single argument — no shell interpolation occurs.
+/// Filenames containing `&`, `;`, spaces, quotes, or Unicode are handled correctly.
 #[tauri::command]
 pub async fn cmd_open_document(path: String) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", "", &path])
+        std::process::Command::new("explorer")
+            .arg(&path)
             .spawn()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Failed to open file: {e}"))?;
     }
     #[cfg(target_os = "macos")]
     {
-        Command::new("open")
+        std::process::Command::new("open")
             .arg(&path)
             .spawn()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Failed to open file: {e}"))?;
     }
     #[cfg(target_os = "linux")]
     {
-        Command::new("xdg-open")
+        std::process::Command::new("xdg-open")
             .arg(&path)
             .spawn()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Failed to open file: {e}"))?;
     }
     Ok(true)
 }
 
+/// Sole write path for document deletion — routes through IndexWorker to uphold
+/// the Single Writer invariant on the `documents` table.
 #[tauri::command]
 pub async fn cmd_remove_document(doc_id: i64, state: State<'_, AppState>) -> Result<bool, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    remove_document(&conn, doc_id).map_err(|e| e.to_string())?;
-    Ok(true)
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    state.index_tx.send(IndexCommand::RemoveDocument {
+        doc_id,
+        reply: Some(reply_tx),
+    })?;
+    reply_rx
+        .recv()
+        .map_err(|e| format!("Failed to receive confirmation from IndexWorker: {e}"))?
 }
